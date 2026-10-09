@@ -1,0 +1,3 @@
+# External modules; the Bazel built-in path explicitly uses Makefile.
+obj-m += actiondfs.o
+obj-m += actiondfs_instrumented.o

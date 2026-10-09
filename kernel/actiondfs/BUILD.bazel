@@ -3,6 +3,7 @@ exports_files([
     "Makefile",
     "actiondfs.c",
     "actiondfs_instrumented.c",
+    "compat.h",
 ])
 
 filegroup(
@@ -12,6 +13,7 @@ filegroup(
         "Makefile",
         "actiondfs.c",
         "actiondfs_instrumented.c",
+        "compat.h",
     ],
     visibility = ["//visibility:public"],
 )

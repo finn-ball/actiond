@@ -49,6 +49,8 @@
 #include <linux/workqueue.h>
 #include <net/sock.h>
 
+#include "compat.h"
+
 #ifndef ACTIONDFS_ENABLE_STATS
 #define ACTIONDFS_ENABLE_STATS 0
 #endif
@@ -554,7 +556,7 @@ static int actiondfs_stage_mkdir_child(struct path *parent_path,
 		goto out_drop_write;
 	}
 
-	created = vfs_mkdir(mnt_idmap(parent_path->mnt),
+	created = actiondfs_vfs_mkdir(mnt_idmap(parent_path->mnt),
 			    d_inode(parent_path->dentry), real_dentry,
 			    mode & S_IALLUGO);
 	inode_unlock(d_inode(parent_path->dentry));
@@ -1163,7 +1165,7 @@ static struct file *actiondfs_open_directory_blob(struct actiondfs_sb_info *sbi,
 
 static struct file *actiondfs_open_backing_cas_blob(struct actiondfs_sb_info *sbi,
 						    const u8 *hash,
-						    const struct path *user_path,
+						    const struct file *user_file,
 						    u64 expected_size)
 {
 	bool fetched = false;
@@ -1198,7 +1200,7 @@ static struct file *actiondfs_open_backing_cas_blob(struct actiondfs_sb_info *sb
 		}
 
 		open_start = actiondfs_stat_time_start();
-		file = backing_file_open(user_path, O_RDONLY, &real_path,
+		file = actiondfs_backing_file_open(user_file, O_RDONLY, &real_path,
 					 current_cred());
 		actiondfs_stat_add_elapsed(ACTIONDFS_STAT_BLOB_OPEN_BACKING_FILE_NS,
 					   open_start);
@@ -1264,7 +1266,7 @@ static struct file *actiondfs_open_staged_backing(struct actiondfs_sb_info *sbi,
 	}
 
 	phase_start = actiondfs_stat_time_start();
-	file = backing_file_open(file_user_path(actiondfs_file), flags,
+	file = actiondfs_backing_file_open(actiondfs_file, flags,
 				 &real_path, current_cred());
 	actiondfs_stat_add_elapsed(ACTIONDFS_STAT_STAGE_BACKING_OPEN_FILE_NS,
 				   phase_start);
@@ -2246,7 +2248,7 @@ static struct inode *actiondfs_iget(struct super_block *sb,
 		inode = iget_locked(sb, node->ino);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
-	if (!(inode->i_state & I_NEW)) {
+	if (!(actiondfs_inode_state(inode) & I_NEW)) {
 		actiondfs_free_node(node);
 		return inode;
 	}
@@ -2545,7 +2547,7 @@ static int actiondfs_create_staged_child(struct inode *dir,
 	if (S_ISDIR(mode)) {
 		struct dentry *created;
 
-		created = vfs_mkdir(mnt_idmap(parent_path.mnt),
+		created = actiondfs_vfs_mkdir(mnt_idmap(parent_path.mnt),
 				    d_inode(parent_path.dentry), real_dentry,
 				    mode & S_IALLUGO);
 		inode_unlock(d_inode(parent_path.dentry));
@@ -2556,12 +2558,12 @@ static int actiondfs_create_staged_child(struct inode *dir,
 		real_dentry = created;
 		err = 0;
 	} else if (target) {
-		err = vfs_symlink(mnt_idmap(parent_path.mnt),
+		err = actiondfs_vfs_symlink(mnt_idmap(parent_path.mnt),
 				  d_inode(parent_path.dentry), real_dentry,
 				  target);
 		inode_unlock(d_inode(parent_path.dentry));
 	} else {
-		err = vfs_create(mnt_idmap(parent_path.mnt),
+		err = actiondfs_vfs_create(mnt_idmap(parent_path.mnt),
 				 d_inode(parent_path.dentry), real_dentry,
 				 mode & S_IALLUGO, excl);
 		inode_unlock(d_inode(parent_path.dentry));
@@ -2648,7 +2650,7 @@ static int actiondfs_remove_staged_child(struct inode *dir,
 	if (!d_inode(real_dentry)) {
 		err = -ENOENT;
 	} else if (directory) {
-		err = vfs_rmdir(mnt_idmap(parent_path.mnt),
+		err = actiondfs_vfs_rmdir(mnt_idmap(parent_path.mnt),
 				d_inode(parent_path.dentry), real_dentry);
 	} else {
 		err = vfs_unlink(mnt_idmap(parent_path.mnt),
@@ -2716,8 +2718,8 @@ static int actiondfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	struct path new_parent_path;
 	struct dentry *real_old = NULL;
 	struct dentry *real_new = NULL;
-	struct dentry *trap;
-	struct renamedata rd = {};
+	struct actiondfs_rename_context rename = {};
+	struct renamedata *rd = &rename.data;
 	struct qstr old_name = QSTR_LEN(old_dentry->d_name.name,
 					old_dentry->d_name.len);
 	struct qstr new_name = QSTR_LEN(new_dentry->d_name.name,
@@ -2749,25 +2751,15 @@ static int actiondfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	if (err)
 		goto out_done;
 
-	trap = lock_rename(new_parent_path.dentry, old_parent_path.dentry);
-	if (IS_ERR(trap)) {
-		err = PTR_ERR(trap);
+	rd->mnt_idmap = mnt_idmap(old_parent_path.mnt);
+	rd->old_parent = old_parent_path.dentry;
+	rd->new_parent = new_parent_path.dentry;
+	rd->flags = flags;
+	err = actiondfs_start_renaming(&rename, &old_name, &new_name);
+	if (err)
 		goto out_drop_write;
-	}
-	real_old = lookup_one(mnt_idmap(old_parent_path.mnt), &old_name,
-			      old_parent_path.dentry);
-	if (IS_ERR(real_old)) {
-		err = PTR_ERR(real_old);
-		real_old = NULL;
-		goto out_unlock;
-	}
-	real_new = lookup_one(mnt_idmap(new_parent_path.mnt), &new_name,
-			      new_parent_path.dentry);
-	if (IS_ERR(real_new)) {
-		err = PTR_ERR(real_new);
-		real_new = NULL;
-		goto out_unlock;
-	}
+	real_old = rd->old_dentry;
+	real_new = rd->new_dentry;
 	if (!d_inode(real_old)) {
 		err = -ENOENT;
 		goto out_unlock;
@@ -2776,22 +2768,10 @@ static int actiondfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 		err = -EEXIST;
 		goto out_unlock;
 	}
-	if (real_old == trap) {
-		err = -EINVAL;
+	err = actiondfs_check_rename_cycle(&rename);
+	if (err)
 		goto out_unlock;
-	}
-	if (real_new == trap) {
-		err = -ENOTEMPTY;
-		goto out_unlock;
-	}
-
-	rd.mnt_idmap = mnt_idmap(old_parent_path.mnt);
-	rd.old_parent = old_parent_path.dentry;
-	rd.old_dentry = real_old;
-	rd.new_parent = new_parent_path.dentry;
-	rd.new_dentry = real_new;
-	rd.flags = flags;
-	err = vfs_rename(&rd);
+	err = vfs_rename(rd);
 	if (!err) {
 		if (new_node)
 			clear_nlink(d_inode(new_dentry));
@@ -2811,11 +2791,7 @@ static int actiondfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	}
 
 out_unlock:
-	if (real_new)
-		dput(real_new);
-	if (real_old)
-		dput(real_old);
-	unlock_rename(new_parent_path.dentry, old_parent_path.dentry);
+	actiondfs_end_renaming(&rename);
 out_drop_write:
 	mnt_drop_write(old_parent_path.mnt);
 out_done:
@@ -2841,7 +2817,7 @@ static int actiondfs_open(struct inode *inode, struct file *file)
 			return 0;
 		actiondfs_stat_inc(ACTIONDFS_STAT_NODE_BLOB_CACHE_MISSES);
 		backing_file = actiondfs_open_backing_cas_blob(
-			sbi, hash, file_user_path(file), node->size);
+			sbi, hash, file, node->size);
 	} else {
 		backing_file = actiondfs_open_staged_backing(
 			sbi, file, actiondfs_staged_backing_flags(file));
