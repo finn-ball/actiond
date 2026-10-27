@@ -1,5 +1,6 @@
 config ACTIONDFS_FS
 	bool "actiond manifest filesystems"
+	depends on UNIX
 	help
 	  Action input manifest filesystems used by actiond VM workers. The
 	  normal actiondfs filesystem maps manifest paths to immutable CAS blobs
